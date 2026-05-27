@@ -1,0 +1,633 @@
+---
+- name: Deploy 3X-UI with nginx, ACME, and Xray backend
+  hosts: vps
+  become: yes
+  become_user: root
+  vars:
+    ansible_user: "def"  # Пользователь для SSH-подключения
+    # === Основные параметры ===
+    domain: "restart2d.webtm.ru"                     # <-- ЗАМЕНИТЕ НА ВАШ ДОМЕН
+    acme_email: "test.1977@gmail.com"          # <-- ЗАМЕНИТЕ НА ВАШ EMAIL (опционально)
+    panel_port: 2053                              # Порт веб-панели 3X-UI (loopback)
+    panel_user: "admin"                           # Логин для входа в панель
+    panel_pass: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+    x_ui_binary: "/usr/bin/x-ui"  # Путь к бинарнику внутри контейнера
+
+    # === Параметры прокси ===
+    xray_backend_port: 1234                       # Порт для Xray VLESS бэкенда (loopback)
+    xray_path: "/xhttp-{{ lookup('password', '/dev/null length=8 chars=hexdigits') }}"
+
+    # === Docker: "official_script" или "distribution" ===
+    docker_install_method: "official_script"      # <-- ПЕРЕКЛЮЧАТЕЛЬ
+    #docker_install_method: "distribution"
+    
+
+    # === Дополнительные настройки ===
+    enable_ufw: true                               # Включить файрвол
+    ssh_port: 22                                   # Порт SSH
+    enable_bbr: true                               # Включить BBR
+    work_dir: "/opt/3x-ui"
+    cert_dir: "{{ work_dir }}/3x-ui-data/cert"
+    db_dir: "{{ work_dir }}/3x-ui-data/db"
+    acme_webroot: "/var/www/acme"
+
+    # === Пакеты по дистрибутивам ===
+    common_packages:
+      - curl
+      - wget
+      - git
+      - nginx
+      - python3
+      - jq
+      - openssl
+      - dnsutils
+
+    ubuntu_packages:
+      - ufw
+      - software-properties-common
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - lsb-release
+
+    debian_packages:
+      - ufw
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - lsb-release
+
+    centos_packages:
+      - firewalld
+      - epel-release
+      - ca-certificates
+      - gnupg
+
+    fedora_packages:
+      - firewalld
+      - ca-certificates
+      - gnupg
+
+    docker_distro_packages:
+      ubuntu:
+        - docker.io
+        - docker-compose-v2
+        - containerd
+      debian:
+        - docker.io
+        - docker-compose-v2
+        - containerd
+      centos:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+        - docker-compose-plugin
+      fedora:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+        - docker-compose-plugin
+
+  tasks:
+    # ============================================================
+    # TAG: system_detect
+    # ============================================================
+    - name: "[system_detect] Определение дистрибутива"
+      block:
+        - name: Сбор информации о системе
+          ansible.builtin.setup:
+            filter: ansible_distribution
+
+        - name: Установка факта дистрибутива
+          ansible.builtin.set_fact:
+            distro_name: "{{ ansible_distribution | lower }}"
+
+        - name: Вывод информации о дистрибутиве
+          ansible.builtin.debug:
+            msg: "Определен дистрибутив: {{ ansible_distribution }} ({{ distro_name }})"
+      tags:
+        - system_detect
+        - always
+
+    # ============================================================
+    # TAG: system_update
+    # ============================================================
+    - name: "[system_update] Обновление системы и установка пакетов"
+      block:
+        - name: Обновление кэша пакетов
+          ansible.builtin.package:
+            update_cache: yes
+            cache_valid_time: 3600
+
+        - name: Установка общих пакетов
+          ansible.builtin.package:
+            name: "{{ common_packages }}"
+            state: present
+
+        - name: Установка пакетов для Ubuntu
+          ansible.builtin.package:
+            name: "{{ ubuntu_packages }}"
+            state: present
+          when: distro_name == 'ubuntu'
+
+        - name: Установка пакетов для Debian
+          ansible.builtin.package:
+            name: "{{ debian_packages }}"
+            state: present
+          when: distro_name == 'debian'
+
+        - name: Установка пакетов для CentOS
+          ansible.builtin.package:
+            name: "{{ centos_packages }}"
+            state: present
+          when: distro_name in ['centos', 'red hat', 'redhat']
+
+        - name: Установка пакетов для Fedora
+          ansible.builtin.package:
+            name: "{{ fedora_packages }}"
+            state: present
+          when: distro_name == 'fedora'
+      tags:
+        - system_update
+
+    # ============================================================
+    # TAG: system_tuning
+    # ============================================================
+    - name: "[system_tuning] Оптимизация системы (BBR)"
+      ansible.builtin.sysctl:
+        name: "{{ item.name }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { name: net.core.default_qdisc, value: fq }
+        - { name: net.ipv4.tcp_congestion_control, value: bbr }
+      when: enable_bbr | bool
+      tags:
+        - system_tuning
+
+    # ============================================================
+    # TAG: docker_install
+    # ============================================================
+    - name: "[docker_install] Установка Docker (официальный скрипт)"
+      block:
+        - name: "[docker_install] Установка Docker из репозитория (Ubuntu)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.ubuntu }}"
+            state: absent
+          when:
+            - docker_install_method == "official_script"
+            - distro_name == 'ubuntu'
+          tags:
+            - docker_install
+  
+        - name: "[docker_install] Установка Docker из репозитория (Debian)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.debian }}"
+            state: absent
+          when:
+            - docker_install_method == "official_script"
+            - distro_name == 'debian'
+          tags:
+            - docker_install
+    
+        - name: "[docker_install] Установка Docker из репозитория (CentOS/RHEL)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.centos }}"
+            state: absent
+          when:
+            - docker_install_method == "official_script"
+            - distro_name in ['centos', 'red hat', 'redhat']
+          tags:
+            - docker_install
+    
+        - name: "[docker_install] Установка Docker из репозитория (Fedora)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.fedora }}"
+            state: absent
+          when:
+            - docker_install_method == "official_script"
+            - distro_name == 'fedora'
+          tags:
+            - docker_install
+    
+        - name: Загрузка и выполнение официального скрипта Docker
+          ansible.builtin.shell: |
+            curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+            sh /tmp/get-docker.sh
+            rm -f /tmp/get-docker.sh
+          args:
+            creates: /usr/bin/docker
+          when: docker_install_method == "official_script"
+          tags:
+            - docker_install
+    
+        # установка Docker из репозитория для дистрибутивов, где это поддерживается (альтернатива официальному скрипту)
+        - name: "[docker_install] Установка Docker из репозитория (Ubuntu)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.ubuntu }}"
+            state: present
+          when:
+            - docker_install_method == "distribution"
+            - distro_name == 'ubuntu'
+          tags:
+            - docker_install
+    
+        - name: "[docker_install] Установка Docker из репозитория (Debian)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.debian }}"
+            state: present
+          when:
+            - docker_install_method == "distribution"
+            - distro_name == 'debian'
+          tags:
+            - docker_install
+    
+        - name: "[docker_install] Установка Docker из репозитория (CentOS/RHEL)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.centos }}"
+            state: present
+          when:
+            - docker_install_method == "distribution"
+            - distro_name in ['centos', 'red hat', 'redhat']
+          tags:
+            - docker_install
+    
+        - name: "[docker_install] Установка Docker из репозитория (Fedora)"
+          ansible.builtin.package:
+            name: "{{ docker_distro_packages.fedora }}"
+            state: present
+          when:
+            - docker_install_method == "distribution"
+            - distro_name == 'fedora'
+          tags:
+            - docker_install
+    
+        # TODO: добавить пользователя в группу docker, если установлен через репозиторий (для возможности запуска без sudo)
+
+    # ============================================================
+    # TAG: directories_create
+    # ============================================================
+    - name: "[directories_create] Создание рабочих директорий"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ work_dir }}"
+        - "{{ cert_dir }}"
+        - "{{ db_dir }}"
+        - "{{ acme_webroot }}"
+      tags:
+        - directories_create
+
+    # ============================================================
+    # TAG: 3xui_deploy
+    # ============================================================
+    - name: "[3xui_deploy] Развертывание 3X-UI в Docker"
+      block:
+        - name: Создание docker-compose.yml
+          ansible.builtin.copy:
+            content: |
+              services:
+                3x-ui:
+                  image: ghcr.io/mhsanaei/3x-ui:latest
+                  container_name: 3x-ui
+                  network_mode: host
+                  volumes:
+                    - "{{ db_dir }}:/etc/x-ui/"
+                    - "{{ cert_dir }}:/root/cert/"
+                    - "{{ work_dir }}/test:/opt/3x-ui/test"
+                  restart: unless-stopped
+            dest: "{{ work_dir }}/docker-compose.yml"
+            mode: '0644'
+
+        - name: Запуск контейнера через docker compose
+          community.docker.docker_compose_v2:
+            project_src: "{{ work_dir }}"
+            recreate: always
+            state: restarted
+          register: compose_result
+
+        - name: Ожидание запуска 3X-UI
+          ansible.builtin.wait_for:
+            port: "{{ panel_port }}"
+            state: started
+            delay: 5
+            timeout: 60
+      tags:
+        - 3xui_deploy
+
+# ============================================================
+    # TAG: 3xui_configure
+    # ============================================================
+    - name: "[3xui_configure] Настройка панели 3X-UI"
+      block:
+        - name: Проверка наличия бинарника x-ui в контейнере
+          ansible.builtin.shell: |
+            docker exec 3x-ui which x-ui
+          register: x_ui_path
+          changed_when: false
+
+        - name: Установка пути к бинарнику
+          ansible.builtin.set_fact:
+            x_ui_binary: "{{ x_ui_path.stdout }}"
+
+        - name: Получение текущих настроек панели
+          ansible.builtin.shell: |
+            docker exec 3x-ui {{ x_ui_binary }} setting -show
+          register: current_settings
+          ignore_errors: yes
+
+        - name: Вывод текущих настроек
+          ansible.builtin.debug:
+            var: current_settings.stdout_lines
+
+        - name: Изменение настроек панели через docker exec
+          ansible.builtin.shell: |
+            docker exec 3x-ui {{ x_ui_binary }} setting \
+              -listenIP 127.0.0.1 \
+              -port {{ panel_port }} \
+              -username {{ panel_user }} \
+              -password {{ panel_pass }}
+          register: setting_result
+
+        - name: Вывод результата настройки
+          ansible.builtin.debug:
+            var: setting_result.stdout_lines
+
+        - name: Перезапуск контейнера для применения настроек
+          ansible.builtin.shell: |
+            docker restart 3x-ui
+
+        - name: Ожидание перезапуска контейнера
+          ansible.builtin.wait_for:
+            port: "{{ panel_port }}"
+            state: started
+            delay: 3
+            timeout: 30
+      tags:
+        - 3xui_configure
+
+    # ============================================================
+    # TAG: dns_check
+    # ============================================================
+    - name: "[dns_check] Проверка DNS-записей домена"
+      ansible.builtin.shell: |
+        dig +short {{ domain }}
+      register: dig_result
+      tags:
+        - dns_check
+
+    - name: "[dns_check] Вывод DNS информации"
+      ansible.builtin.debug:
+        msg: "A записи для {{ domain }}: {{ dig_result.stdout_lines }}"
+      tags:
+        - dns_check
+
+    # ============================================================
+    # TAG: acme_certificate
+    # ============================================================
+    - name: "[acme_certificate] Установка acme.sh и выпуск сертификата"
+      block:
+        - name: Установка acme.sh
+          ansible.builtin.shell: |
+            curl -fsSL https://get.acme.sh | sh -s email={{ acme_email }}
+          args:
+            creates: /root/.acme.sh/acme.sh
+
+        - name: Выпуск сертификата Let's Encrypt
+          ansible.builtin.shell: |
+            /root/.acme.sh/acme.sh --issue -d {{ domain }} -w {{ acme_webroot }} --keylength ec-256
+          register: acme_issue
+          failed_when: false
+
+        - name: Установка сертификата в cert_dir
+          ansible.builtin.shell: |
+            /root/.acme.sh/acme.sh --install-cert -d {{ domain }} --ecc \
+              --fullchain-file "{{ cert_dir }}/fullchain.cer" \
+              --key-file "{{ cert_dir }}/private.key" \
+              --reloadcmd "systemctl reload nginx"
+          when: acme_issue.rc == 0
+      tags:
+        - acme_certificate
+
+    # ============================================================
+    # TAG: nginx_configure
+    # ============================================================
+    - name: "[nginx_configure] Настройка nginx"
+      block:
+        - name: Создание конфигурации nginx
+          ansible.builtin.copy:
+            content: |
+              server {
+                  listen 80;
+                  server_name {{ domain }};
+                  root {{ acme_webroot }};
+
+                  location /.well-known/acme-challenge/ {
+                      root {{ acme_webroot }};
+                  }
+
+                  location / {
+                      return 301 https://$server_name$request_uri;
+                  }
+              }
+
+              server {
+                  listen 443 ssl http2;
+                  server_name {{ domain }};
+
+                  ssl_certificate {{ cert_dir }}/fullchain.cer;
+                  ssl_certificate_key {{ cert_dir }}/private.key;
+
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+
+                  location {{ xray_path }} {
+                      grpc_pass grpc://127.0.0.1:{{ xray_backend_port }};
+                      grpc_set_header Host {{ domain }};
+                      client_max_body_size 0;
+                      client_body_timeout 120s;
+                  }
+
+                  location / {
+                      return 401 "Unauthorized";
+                  }
+              }
+            dest: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
+            mode: '0644'
+
+        - name: Включение сайта
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
+            dest: "/etc/nginx/sites-enabled/3x-ui-{{ domain }}.conf"
+            state: link
+
+        - name: Отключение сайта по умолчанию
+          ansible.builtin.file:
+            path: "/etc/nginx/sites-enabled/default"
+            state: absent
+
+        - name: Перезапуск nginx
+          ansible.builtin.systemd:
+            name: nginx
+            state: restarted
+      tags:
+        - nginx_configure
+
+    # ============================================================
+    # TAG: inbound_create
+    # ============================================================
+    - name: "[inbound_create] Создание inbound для VLESS+XHTTP"
+      block:
+        - name: Генерация UUID для клиента
+          ansible.builtin.shell: |
+            cat /proc/sys/kernel/random/uuid
+          register: client_uuid
+
+        - name: Логин в панель и получение сессии
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ panel_port }}/login"
+            method: POST
+            body_format: json
+            body:
+              username: "{{ panel_user }}"
+              password: "{{ panel_pass }}"
+            status_code: 200
+          register: login_response
+
+        - name: Сохранение cookie сессии
+          ansible.builtin.set_fact:
+            session_cookie: "{{ login_response.set_cookie | regex_search('3x-ui=[^;]+') }}"
+
+        - name: Добавление inbound VLESS + XHTTP
+          ansible.builtin.uri:
+            url: "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/add"
+            method: POST
+            headers:
+              Cookie: "{{ session_cookie }}"
+            body_format: json
+            body:
+              up: 0
+              down: 0
+              total: 0
+              remark: "VLESS-XHTTP-TLS"
+              enable: true
+              expiryTime: 0
+              listen: "127.0.0.1"
+              port: "{{ xray_backend_port }}"
+              protocol: "vless"
+              settings: |
+                {
+                  "clients": [{
+                    "id": "{{ client_uuid.stdout }}",
+                    "email": "default@{{ domain }}",
+                    "flow": "",
+                    "limitIp": 0,
+                    "totalGB": 0,
+                    "expiryTime": 0,
+                    "enable": true,
+                    "tgId": "",
+                    "subId": "{{ lookup('password', '/dev/null length=8 chars=hexdigits') }}",
+                    "reset": 0
+                  }],
+                  "decryption": "none",
+                  "fallbacks": []
+                }
+              streamSettings: |
+                {
+                  "network": "xhttp",
+                  "security": "none",
+                  "xhttpSettings": {
+                    "path": "{{ xray_path }}",
+                    "host": "{{ domain }}",
+                    "mode": "auto"
+                  }
+                }
+              sniffing: |
+                {
+                  "enabled": true,
+                  "destOverride": ["http", "tls", "quic"],
+                  "metadataOnly": false,
+                  "routeOnly": false
+                }
+            status_code: 200
+      tags:
+        - inbound_create
+
+    # ============================================================
+    # TAG: firewall_configure
+    # ============================================================
+    - name: "[firewall_configure] Настройка файрвола (UFW)"
+      block:
+        - name: Разрешение портов (UFW)
+          community.general.ufw:
+            rule: allow
+            port: "{{ item }}"
+            proto: tcp
+          loop:
+            - "{{ ssh_port }}"
+            - "80"
+            - "443"
+          when: distro_name in ['ubuntu', 'debian']
+
+        - name: Включение UFW
+          community.general.ufw:
+            state: enabled
+            policy: deny
+          when:
+            - distro_name in ['ubuntu', 'debian']
+            - enable_ufw | bool
+
+        - name: Разрешение портов (firewalld для CentOS/Fedora)
+          ansible.builtin.firewalld:
+            port: "{{ item }}/tcp"
+            permanent: yes
+            state: enabled
+            immediate: yes
+          loop:
+            - "{{ ssh_port }}"
+            - "80"
+            - "443"
+          when:
+            - distro_name in ['centos', 'red hat', 'redhat', 'fedora']
+            - enable_ufw | bool
+      tags:
+        - firewall_configure
+
+    # ============================================================
+    # TAG: connection_info
+    # ============================================================
+    - name: "[connection_info] Вывод данных для подключения"
+      block:
+        - name: Вывод данных в консоль
+          ansible.builtin.debug:
+            msg: |
+              === 3X-UI успешно развернут! ===
+              Дистрибутив: {{ ansible_distribution }}
+              Панель управления (только через SSH-туннель):
+                ssh -L 12053:127.0.0.1:{{ panel_port }} root@{{ ansible_default_ipv4.address }}
+                http://127.0.0.1:12053
+              Логин: {{ panel_user }}
+              Пароль: {{ panel_pass }}
+
+              VLESS-подключение:
+              vless://{{ client_uuid.stdout }}@{{ domain }}:443?encryption=none&security=tls&sni={{ domain }}&host={{ domain }}&alpn=h2&type=xhttp&path={{ xray_path }}#VLESS-XHTTP-TLS
+
+        - name: Сохранение учетных данных в файл
+          ansible.builtin.copy:
+            content: |
+              Дистрибутив: {{ ansible_distribution }}
+              Панель управления (только через SSH-туннель):
+                ssh -L 12053:127.0.0.1:{{ panel_port }} root@{{ ansible_default_ipv4.address }}
+                http://127.0.0.1:12053
+              Логин: {{ panel_user }}
+              Пароль: {{ panel_pass }}
+
+              VLESS-подключение:
+              vless://{{ client_uuid.stdout }}@{{ domain }}:443?encryption=none&security=tls&sni={{ domain }}&host={{ domain }}&alpn=h2&type=xhttp&path={{ xray_path }}#VLESS-XHTTP-TLS
+            dest: "/root/vpn-credentials.txt"
+            mode: '0600'
+      tags:
+        - connection_info
