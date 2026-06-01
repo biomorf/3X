@@ -1,5 +1,6 @@
 [vps]
 81.26.183.91 ansible_user=def ansible_port=22
+#restart2d.online ansible_user=def ansible_port=22
 
 [vps:vars]
 ansible_become=yes

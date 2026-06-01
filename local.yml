@@ -4,36 +4,34 @@
   become: yes
   become_user: root
   vars:
-    ansible_user: "def"  # Пользователь для SSH-подключения
+    ansible_user: "def"
     # === Основные параметры ===
-    domain: "restart2d.site"                     # <-- ЗАМЕНИТЕ НА ВАШ ДОМЕН
-    acme_email: "test.1977@gmail.com"          # <-- ЗАМЕНИТЕ НА ВАШ EMAIL (опционально)
-    acme_certificate_force_update: false          # <-- Установите true для принудительного обновления
-    panel_port: 2053                              # Порт веб-панели 3X-UI (loopback)
-    panel_user: "admin"                           # Логин для входа в панель
+    domain: "restart2d.site"
+    panel_domain: "panel.{{ domain }}"           # поддомен для панели
+    acme_email: "test.1977@gmail.com"
+    acme_certificate_force_update: false
+    panel_port: 2053
+    panel_user: "admin"
     panel_pass: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
-    x_ui_binary: "/usr/bin/x-ui"  # Путь к бинарнику внутри контейнера
+    x_ui_binary: "/usr/bin/x-ui"
 
     # === Параметры прокси ===
-    xray_port: 443                                # Порт для VLESS+Reality
-    reality_dest: "www.microsoft.com:443"          # Сайт для маскировки Reality
-    reality_server_name: "www.microsoft.com"       # SNI для маскировки
+    xray_port: 443
+    reality_dest: "login.vk.ru:443"
+    reality_server_name: "login.vk.ru"
 
     # === Docker: "official_script" или "distribution" ===
-    docker_install_method: "official_script"      # <-- ПЕРЕКЛЮЧАТЕЛЬ
-    #docker_install_method: "distribution"
-    
+    docker_install_method: "official_script"
 
     # === Дополнительные настройки ===
-    enable_ufw: true                               # Включить файрвол
-    ssh_port: 22                                   # Порт SSH
-    enable_bbr: true                               # Включить BBR
+    enable_ufw: true
+    ssh_port: 22
+    enable_bbr: true
     work_dir: "/opt/3x-ui"
     cert_dir: "{{ work_dir }}/3x-ui-data/cert"
     db_dir: "{{ work_dir }}/3x-ui-data/db"
     acme_webroot: "/var/www/acme"
-    nginx_https_port: 8443                        # Порт для nginx HTTPS (панель + будущие сайты)
-    panel_proxy_path: "/panel-{{ lookup('password', '/dev/null length=12 chars=hexdigits') }}"
+    nginx_https_port: 8443
 
     # === Пакеты по дистрибутивам ===
     common_packages:
@@ -212,35 +210,91 @@
       tags:
         - firewall_configure
 
-
-
     # ============================================================
     # TAG: dns_check
     # ============================================================
-    - name: "[dns_check] Проверка DNS-записей домена"
-      ansible.builtin.shell: |
-        dig +short {{ domain }}
-      register: dig_result
-      tags:
-        - dns_check
+    - name: "[dns_check] Проверка DNS-записей домена и поддомена"
+      block:
+        - name: Получение внешнего IP сервера
+          ansible.builtin.shell: |
+            curl -s ifconfig.me
+          register: server_ip
+          changed_when: false
 
-    - name: "[dns_check] Вывод DNS информации"
-      ansible.builtin.debug:
-        msg: "A записи для {{ domain }}: {{ dig_result.stdout_lines }}"
+        - name: Получение A-записи основного домена
+          ansible.builtin.shell: |
+            dig +short {{ domain }} A | head -1
+          register: domain_ip
+          changed_when: false
+
+        - name: Получение A-записи панельного поддомена
+          ansible.builtin.shell: |
+            dig +short {{ panel_domain }} A | head -1
+          register: panel_domain_ip
+          changed_when: false
+
+        - name: Вывод информации о DNS
+          ansible.builtin.debug:
+            msg: |
+              === DNS CHECK ===
+              IP сервера: {{ server_ip.stdout }}
+              A-запись {{ domain }}: {{ domain_ip.stdout }}
+              A-запись {{ panel_domain }}: {{ panel_domain_ip.stdout }}
+              DNS основного домена указывает на сервер: {{ server_ip.stdout == domain_ip.stdout }}
+              DNS панельного домена указывает на сервер: {{ server_ip.stdout == panel_domain_ip.stdout }}
+
+        - name: Остановка при несовпадении DNS
+          ansible.builtin.fail:
+            msg: |
+              DNS-записи не указывают на этот сервер.
+              Основной домен {{ domain }} ожидает {{ server_ip.stdout }}, получен {{ domain_ip.stdout }}
+              Панельный домен {{ panel_domain }} ожидает {{ server_ip.stdout }}, получен {{ panel_domain_ip.stdout }}
+              Исправьте A-записи и запустите плейбук заново.
+          when: server_ip.stdout != domain_ip.stdout or server_ip.stdout != panel_domain_ip.stdout
+
+        - name: DNS проверка пройдена успешно
+          ansible.builtin.debug:
+            msg: "DNS-записи для {{ domain }} и {{ panel_domain }} корректно указывают на сервер."
+          when: server_ip.stdout == domain_ip.stdout and server_ip.stdout == panel_domain_ip.stdout
       tags:
         - dns_check
+        - always
 
     # ============================================================
-    # TAG: nginx_configure (предварительная настройка для ACME)
+    # TAG: directories_create
+    # ============================================================
+    - name: "[directories_create] Создание рабочих директорий"
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "{{ work_dir }}"
+        - "{{ cert_dir }}"
+        - "{{ db_dir }}"
+        - "{{ acme_webroot }}"
+      tags:
+        - directories_create
+
+    # ============================================================
+    # TAG: nginx_configure
     # ============================================================
     - name: "[nginx_configure] Предварительная настройка nginx для ACME"
       block:
+        - name: Полная очистка всех конфигураций nginx
+          ansible.builtin.shell: |
+            rm -f /etc/nginx/sites-enabled/*
+            rm -f /etc/nginx/sites-available/*
+            rm -f /etc/nginx/conf.d/*
+            sed -i '/ssl_certificate/d; /ssl_certificate_key/d' /etc/nginx/nginx.conf 2>/dev/null || true
+          ignore_errors: yes
+
         - name: Создание временной конфигурации nginx для ACME
           ansible.builtin.copy:
             content: |
               server {
                   listen 80;
-                  server_name {{ domain }};
+                  server_name {{ domain }} {{ panel_domain }};
                   root {{ acme_webroot }};
 
                   location /.well-known/acme-challenge/ {
@@ -260,20 +314,33 @@
             dest: "/etc/nginx/sites-enabled/3x-ui-{{ domain }}.conf"
             state: link
 
-        - name: Отключение сайта по умолчанию
-          ansible.builtin.file:
-            path: "/etc/nginx/sites-enabled/default"
-            state: absent
+        - name: Остановка nginx
+          ansible.builtin.systemd:
+            name: nginx
+            state: stopped
+          ignore_errors: yes
+
+        - name: Освобождение порта 80
+          ansible.builtin.shell: |
+            fuser -k 80/tcp || true
+          ignore_errors: yes
 
         - name: Проверка конфигурации nginx
           ansible.builtin.shell: |
             nginx -t
           register: nginx_test
+          ignore_errors: yes
 
-        - name: Перезапуск nginx
+        - name: Вывод ошибки конфигурации при проблемах
+          ansible.builtin.debug:
+            var: nginx_test.stderr_lines
+          when: nginx_test.rc != 0
+
+        - name: Запуск nginx
           ansible.builtin.systemd:
             name: nginx
-            state: restarted
+            state: started
+            daemon_reload: yes
           when: nginx_test.rc == 0
 
         - name: Проверка доступности порта 80
@@ -282,33 +349,53 @@
             state: started
             delay: 2
             timeout: 10
+          when: nginx_test.rc == 0
       tags:
         - nginx_configure
         - acme_certificate
-
-
-
-    # ============================================================
-    # TAG: acme_directories_create
-    # ============================================================
-    - name: "[directories_create] Создание рабочих директорий"
-      ansible.builtin.file:
-        path: "{{ item }}"
-        state: directory
-        mode: '0755'
-      loop:
-        - "{{ work_dir }}"
-        - "{{ cert_dir }}"
-        - "{{ db_dir }}"
-        - "{{ acme_webroot }}"
-      tags:
-        - acme_directories_create
 
     # ============================================================
     # TAG: acme_certificate
     # ============================================================
     - name: "[acme_certificate] Установка acme.sh и выпуск сертификата"
       block:
+        - name: Проверка DNS перед выпуском сертификата
+          block:
+            - name: Получение внешнего IP сервера
+              ansible.builtin.shell: |
+                curl -s ifconfig.me
+              register: acme_server_ip
+              changed_when: false
+
+            - name: Получение A-записи основного домена
+              ansible.builtin.shell: |
+                dig +short {{ domain }} A | head -1
+              register: acme_domain_ip
+              changed_when: false
+
+            - name: Получение A-записи панельного домена
+              ansible.builtin.shell: |
+                dig +short {{ panel_domain }} A | head -1
+              register: acme_panel_ip
+              changed_when: false
+
+            - name: Вывод информации о DNS
+              ansible.builtin.debug:
+                msg: |
+                  === DNS CHECK (ACME) ===
+                  IP сервера: {{ acme_server_ip.stdout }}
+                  A-запись {{ domain }}: {{ acme_domain_ip.stdout }}
+                  A-запись {{ panel_domain }}: {{ acme_panel_ip.stdout }}
+
+            - name: Остановка при несовпадении DNS
+              ansible.builtin.fail:
+                msg: |
+                  DNS не указывает на сервер.
+                  Основной домен {{ domain }}: ожидается {{ acme_server_ip.stdout }}, получен {{ acme_domain_ip.stdout }}
+                  Панельный домен {{ panel_domain }}: ожидается {{ acme_server_ip.stdout }}, получен {{ acme_panel_ip.stdout }}
+                  Исправьте записи и повторите.
+              when: acme_server_ip.stdout != acme_domain_ip.stdout or acme_server_ip.stdout != acme_panel_ip.stdout
+
         - name: Установка acme.sh
           ansible.builtin.shell: |
             curl -fsSL https://get.acme.sh | sh -s email={{ acme_email }}
@@ -324,42 +411,55 @@
             /root/.acme.sh/acme.sh --register-account -m {{ acme_email }}
           ignore_errors: yes
 
-        - name: Проверка наличия сертификатов
+        - name: Проверка наличия сертификатов в cert_dir
           ansible.builtin.stat:
             path: "{{ cert_dir }}/fullchain.cer"
           register: cert_stat
 
-        - name: Проверка наличия приватного ключа
+        - name: Проверка наличия приватного ключа в cert_dir
           ansible.builtin.stat:
             path: "{{ cert_dir }}/private.key"
           register: key_stat
 
+        - name: Проверка валидности сертификата
+          ansible.builtin.shell: |
+            openssl x509 -in "{{ cert_dir }}/fullchain.cer" -noout -subject 2>&1 || echo "INVALID"
+          register: cert_valid
+          when: cert_stat.stat.exists and cert_stat.stat.size | default(0) > 0
+          changed_when: false
+          ignore_errors: yes
+
         - name: Определение необходимости выпуска сертификата
           ansible.builtin.set_fact:
-            need_new_cert: "{{ not cert_stat.stat.exists or not key_stat.stat.exists or acme_certificate_force_update | bool }}"
+            need_new_cert: "{{ 
+              not cert_stat.stat.exists or 
+              not key_stat.stat.exists or 
+              cert_stat.stat.size | default(0) < 100 or 
+              (cert_valid.stdout | default('')) == 'INVALID' or
+              acme_certificate_force_update | bool 
+            }}"
 
         - name: Вывод информации о необходимости обновления
           ansible.builtin.debug:
             msg: |
               Сертификат существует: {{ cert_stat.stat.exists | default(false) }}
-              Приватный ключ существует: {{ key_stat.stat.exists | default(false) }}
+              Размер: {{ cert_stat.stat.size | default(0) }} байт
+              Валидность: {{ cert_valid.stdout | default('N/A') }}
+              Ключ существует: {{ key_stat.stat.exists | default(false) }}
               Принудительное обновление: {{ acme_certificate_force_update }}
-              Выпуск нового сертификата: {{ need_new_cert }}
+              Нужен новый сертификат: {{ need_new_cert }}
 
-        - name: Выпуск сертификата Let's Encrypt
+        - name: Выпуск сертификата Let's Encrypt (основной + панельный домены)
           ansible.builtin.shell: |
-            /root/.acme.sh/acme.sh --issue -d {{ domain }} -w {{ acme_webroot }} --keylength ec-256 --debug 2>&1 | tee /tmp/acme_debug.log
+            /root/.acme.sh/acme.sh --issue -d {{ domain }} -d {{ panel_domain }} -w {{ acme_webroot }} --keylength ec-256 --force
           register: acme_issue
           when: need_new_cert | bool
 
-        - name: Вывод отладочной информации в случае ошибки
-          ansible.builtin.shell: |
-            tail -50 /tmp/acme_debug.log
-          when:
-            - acme_issue is defined
-            - acme_issue.rc is defined
-            - acme_issue.rc != 0
-          ignore_errors: yes
+        - name: Проверка успешности выпуска
+          ansible.builtin.stat:
+            path: "/root/.acme.sh/{{ domain }}_ecc/fullchain.cer"
+          register: acme_cert_file
+          when: need_new_cert | bool
 
         - name: Установка сертификата в cert_dir
           ansible.builtin.shell: |
@@ -369,29 +469,59 @@
               --reloadcmd "systemctl reload nginx"
           when:
             - need_new_cert | bool
-            - acme_issue.rc is defined
-            - acme_issue.rc == 0
+            - acme_cert_file.stat.exists | default(false)
 
-        - name: Пропуск выпуска сертификата (сертификат уже существует)
+        - name: Пропуск выпуска сертификата
           ansible.builtin.debug:
-            msg: "Сертификат для {{ domain }} уже существует. Пропускаем выпуск."
+            msg: "Сертификат для {{ domain }} уже существует и валиден. Пропускаем выпуск."
           when: not need_new_cert | bool
       tags:
         - acme_certificate
 
-
-
     # ============================================================
     # TAG: nginx_final_configure
     # ============================================================
-    - name: "[nginx_final_configure] Финальная настройка nginx с HTTPS"
+    - name: "[nginx_final_configure] Финальная настройка nginx с HTTPS и панелью на поддомене"
       block:
-        - name: Создание полной конфигурации nginx с HTTPS
+        - name: Проверка наличия валидного сертификата
+          ansible.builtin.stat:
+            path: "{{ cert_dir }}/fullchain.cer"
+          register: final_cert_check
+
+        - name: Проверка валидности сертификата
+          ansible.builtin.shell: |
+            openssl x509 -in "{{ cert_dir }}/fullchain.cer" -noout -subject 2>&1 || echo "INVALID"
+          register: cert_valid_check
+          when: final_cert_check.stat.exists and final_cert_check.stat.size | default(0) >= 100
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Установка факта валидности сертификата
+          ansible.builtin.set_fact:
+            cert_is_valid: "{{ cert_valid_check.stdout | default('INVALID') != 'INVALID' }}"
+          when: final_cert_check.stat.exists
+
+        - name: Пропуск настройки HTTPS при отсутствии валидного сертификата
+          ansible.builtin.debug:
+            msg: "Сертификат не найден или невалиден. Пропускаем настройку HTTPS."
+          when: not cert_is_valid | default(false)
+
+        - name: Полная очистка ВСЕХ конфигураций nginx
+          ansible.builtin.shell: |
+            rm -f /etc/nginx/sites-enabled/*
+            rm -f /etc/nginx/sites-available/*
+            rm -f /etc/nginx/conf.d/*
+            sed -i '/ssl_certificate/d; /ssl_certificate_key/d' /etc/nginx/nginx.conf 2>/dev/null || true
+          ignore_errors: yes
+          when: cert_is_valid | default(false)
+
+        - name: Создание конфигурации nginx (основной домен + панельный поддомен)
           ansible.builtin.copy:
             content: |
+              # HTTP для обоих доменов -> HTTPS
               server {
                   listen 80;
-                  server_name {{ domain }};
+                  server_name {{ domain }} {{ panel_domain }};
                   root {{ acme_webroot }};
 
                   location /.well-known/acme-challenge/ {
@@ -399,23 +529,37 @@
                   }
 
                   location / {
-                      return 301 https://$server_name:{{ nginx_https_port }}$request_uri;
+                      return 301 https://$host:{{ nginx_https_port }}$request_uri;
                   }
               }
 
+              # Основной домен: заглушка
               server {
                   listen {{ nginx_https_port }} ssl http2;
                   server_name {{ domain }};
 
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
-
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
 
-                  # Прокси к панели 3X-UI
-                  location {{ panel_proxy_path }} {
-                      proxy_pass http://127.0.0.1:{{ panel_port }};
+                  location / {
+                      return 200 "OK";
+                  }
+              }
+
+              # Панельный поддомен: проксирование панели
+              server {
+                  listen {{ nginx_https_port }} ssl http2;
+                  server_name {{ panel_domain }};
+
+                  ssl_certificate {{ cert_dir }}/fullchain.cer;
+                  ssl_certificate_key {{ cert_dir }}/private.key;
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+
+                  location / {
+                      proxy_pass http://127.0.0.1:{{ panel_port }}/;
                       proxy_http_version 1.1;
                       proxy_set_header Upgrade $http_upgrade;
                       proxy_set_header Connection "upgrade";
@@ -424,76 +568,91 @@
                       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                       proxy_set_header X-Forwarded-Proto $scheme;
                   }
-
-                  # Заглушка для остальных запросов
-                  location / {
-                      return 200 "OK";
-                  }
               }
             dest: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
             mode: '0644'
+          when: cert_is_valid | default(false)
+
+        - name: Включение сайта
+          ansible.builtin.file:
+            src: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
+            dest: "/etc/nginx/sites-enabled/3x-ui-{{ domain }}.conf"
+            state: link
+            force: yes
+          when: cert_is_valid | default(false)
 
         - name: Проверка конфигурации nginx
           ansible.builtin.shell: |
             nginx -t
           register: nginx_final_test
+          when: cert_is_valid | default(false)
+          ignore_errors: yes
+
+        - name: Вывод ошибки конфигурации
+          ansible.builtin.debug:
+            var: nginx_final_test.stderr_lines
+          when:
+            - nginx_final_test is defined
+            - nginx_final_test.rc | default(0) != 0
 
         - name: Перезапуск nginx
           ansible.builtin.systemd:
             name: nginx
             state: restarted
-          when: nginx_final_test.rc == 0
+            daemon_reload: yes
+          when:
+            - nginx_final_test is defined
+            - nginx_final_test.rc | default(1) == 0
+
+        - name: Проверка доступности порта {{ nginx_https_port }}
+          ansible.builtin.wait_for:
+            port: "{{ nginx_https_port }}"
+            state: started
+            delay: 2
+            timeout: 10
+          when:
+            - nginx_final_test is defined
+            - nginx_final_test.rc | default(1) == 0
       tags:
         - nginx_final_configure
-
-
-
 
     # ============================================================
     # TAG: docker_install
     # ============================================================
-    - name: "[docker_install] Установка Docker (официальный скрипт)"
+    - name: "[docker_install] Установка Docker"
       block:
-        - name: "[docker_install] Установка Docker из репозитория (Ubuntu)"
+        - name: Удаление пакетов Docker из репозитория (Ubuntu)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.ubuntu }}"
             state: absent
           when:
             - docker_install_method == "official_script"
             - distro_name == 'ubuntu'
-          tags:
-            - docker_install
-  
-        - name: "[docker_install] Установка Docker из репозитория (Debian)"
+
+        - name: Удаление пакетов Docker из репозитория (Debian)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.debian }}"
             state: absent
           when:
             - docker_install_method == "official_script"
             - distro_name == 'debian'
-          tags:
-            - docker_install
-    
-        - name: "[docker_install] Установка Docker из репозитория (CentOS/RHEL)"
+
+        - name: Удаление пакетов Docker из репозитория (CentOS/RHEL)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.centos }}"
             state: absent
           when:
             - docker_install_method == "official_script"
             - distro_name in ['centos', 'red hat', 'redhat']
-          tags:
-            - docker_install
-    
-        - name: "[docker_install] Установка Docker из репозитория (Fedora)"
+
+        - name: Удаление пакетов Docker из репозитория (Fedora)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.fedora }}"
             state: absent
           when:
             - docker_install_method == "official_script"
             - distro_name == 'fedora'
-          tags:
-            - docker_install
-    
+
         - name: Загрузка и выполнение официального скрипта Docker
           ansible.builtin.shell: |
             curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
@@ -502,57 +661,73 @@
           args:
             creates: /usr/bin/docker
           when: docker_install_method == "official_script"
-          tags:
-            - docker_install
-    
-        # установка Docker из репозитория для дистрибутивов, где это поддерживается (альтернатива официальному скрипту)
-        - name: "[docker_install] Установка Docker из репозитория (Ubuntu)"
+
+        - name: Установка Docker из репозитория (Ubuntu)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.ubuntu }}"
             state: present
           when:
             - docker_install_method == "distribution"
             - distro_name == 'ubuntu'
-          tags:
-            - docker_install
-    
-        - name: "[docker_install] Установка Docker из репозитория (Debian)"
+
+        - name: Установка Docker из репозитория (Debian)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.debian }}"
             state: present
           when:
             - docker_install_method == "distribution"
             - distro_name == 'debian'
-          tags:
-            - docker_install
-    
-        - name: "[docker_install] Установка Docker из репозитория (CentOS/RHEL)"
+
+        - name: Установка Docker из репозитория (CentOS/RHEL)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.centos }}"
             state: present
           when:
             - docker_install_method == "distribution"
             - distro_name in ['centos', 'red hat', 'redhat']
-          tags:
-            - docker_install
-    
-        - name: "[docker_install] Установка Docker из репозитория (Fedora)"
+
+        - name: Установка Docker из репозитория (Fedora)
           ansible.builtin.package:
             name: "{{ docker_distro_packages.fedora }}"
             state: present
           when:
             - docker_install_method == "distribution"
             - distro_name == 'fedora'
-          tags:
-            - docker_install
-    
-        # TODO: добавить пользователя в группу docker, если установлен через репозиторий (для возможности запуска без sudo)
+      tags:
+        - docker_install
 
     # ============================================================
     # TAG: 3xui_deploy
     # ============================================================
     - name: "[3xui_deploy] Развертывание 3X-UI в Docker"
       block:
+        - name: Сохранение состояния nginx перед остановкой
+          ansible.builtin.shell: |
+            systemctl is-active nginx || echo "inactive"
+          register: nginx_was_active
+          changed_when: false
+
+        - name: Остановка nginx для освобождения порта {{ xray_port }}
+          ansible.builtin.systemd:
+            name: nginx
+            state: stopped
+          ignore_errors: yes
+
+        - name: Проверка, что порт {{ xray_port }} свободен
+          ansible.builtin.shell: |
+            ss -tlnp | grep ':{{ xray_port }}' || echo "PORT_FREE"
+          register: port_check
+          changed_when: false
+
+        - name: Вывод статуса порта
+          ansible.builtin.debug:
+            var: port_check.stdout_lines
+
+        - name: Принудительное освобождение порта
+          ansible.builtin.shell: |
+            fuser -k {{ xray_port }}/tcp || true
+          when: "'PORT_FREE' not in port_check.stdout"
+
         - name: Создание docker-compose.yml
           ansible.builtin.copy:
             content: |
@@ -564,7 +739,6 @@
                   volumes:
                     - "{{ db_dir }}:/etc/x-ui/"
                     - "{{ cert_dir }}:/root/cert/"
-                    - "{{ work_dir }}/test:/opt/3x-ui/test"
                   restart: unless-stopped
             dest: "{{ work_dir }}/docker-compose.yml"
             mode: '0644'
@@ -572,8 +746,7 @@
         - name: Запуск контейнера через docker compose
           community.docker.docker_compose_v2:
             project_src: "{{ work_dir }}"
-            recreate: always
-            state: restarted
+            state: present
           register: compose_result
 
         - name: Ожидание запуска 3X-UI
@@ -582,10 +755,29 @@
             state: started
             delay: 5
             timeout: 60
+
+        - name: Проверка логов контейнера при ошибке
+          ansible.builtin.shell: |
+            docker logs 3x-ui 2>&1 | tail -30
+          register: container_logs
+          when: compose_result.failed | default(false)
+          ignore_errors: yes
+
+        - name: Вывод логов контейнера
+          ansible.builtin.debug:
+            var: container_logs.stdout_lines
+          when: container_logs.stdout_lines is defined
+
+        - name: Восстановление nginx после запуска 3X-UI
+          ansible.builtin.systemd:
+            name: nginx
+            state: started
+          when: nginx_was_active.stdout != 'inactive'
+          ignore_errors: yes
       tags:
         - 3xui_deploy
 
-# ============================================================
+    # ============================================================
     # TAG: 3xui_configure
     # ============================================================
     - name: "[3xui_configure] Настройка панели 3X-UI"
@@ -636,18 +828,17 @@
       tags:
         - 3xui_configure
 
-
     # ============================================================
-    # TAG: inbound_create (VLESS+TCP+Reality через curl)
+    # TAG: inbound_create
     # ============================================================
-    - name: "[inbound_create] Создание inbound для VLESS+TCP+Reality (через curl)"
+    - name: "[inbound_create] Создание inbound для VLESS+TCP+Reality"
       block:
         - name: Генерация UUID для клиента
           ansible.builtin.shell: |
             cat /proc/sys/kernel/random/uuid
           register: client_uuid
 
-        - name: Логин в панель через curl в контейнере
+        - name: Логин в панель через curl
           ansible.builtin.shell: |
             COOKIE=$(mktemp)
             curl -s -c "$COOKIE" -X POST \
@@ -689,14 +880,15 @@
     # ============================================================
     - name: "[connection_info] Вывод данных для подключения"
       block:
-        - name: Вывод данных в консоль
-          ansible.builtin.debug:
-            msg: |
+        - name: Формирование сообщения с данными
+          ansible.builtin.set_fact:
+            connection_message: |
               === 3X-UI успешно развернут! ===
+              Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
               Дистрибутив: {{ ansible_distribution }}
               
               Панель управления:
-                https://{{ domain }}:{{ nginx_https_port }}{{ panel_proxy_path }}
+                https://{{ panel_domain }}:{{ nginx_https_port }}/
                 Логин: {{ panel_user }}
                 Пароль: {{ panel_pass }}
               
@@ -716,23 +908,47 @@
               ВНИМАНИЕ: Reality-ключи генерируются панелью автоматически.
               Зайдите в панель, откройте inbound и скопируйте готовую vless:// ссылку.
 
+        - name: Вывод данных в консоль
+          ansible.builtin.debug:
+            msg: "{{ connection_message }}"
+
         - name: Сохранение учетных данных в файл
           ansible.builtin.copy:
-            content: |
-              Дистрибутив: {{ ansible_distribution }}
-              Панель управления: https://{{ domain }}:{{ nginx_https_port }}{{ panel_proxy_path }}
-              Логин: {{ panel_user }}
-              Пароль: {{ panel_pass }}
-              
-              VLESS+TCP+Reality:
-              Адрес: {{ domain }}
-              Порт: {{ xray_port }}
-              UUID: {{ client_uuid.stdout }}
-              Flow: xtls-rprx-vision
-              Security: reality
-              SNI: {{ reality_server_name }}
-              Fingerprint: chrome
+            content: "{{ connection_message }}"
             dest: "/root/vpn-credentials.txt"
             mode: '0600'
+
+        - name: Добавление записи в лог деплоев
+          ansible.builtin.lineinfile:
+            path: /root/vpn-deploy.log
+            line: "========================================"
+            create: yes
+            mode: '0600'
+
+        - name: Добавление даты в лог
+          ansible.builtin.lineinfile:
+            path: /root/vpn-deploy.log
+            line: "Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}"
+
+        - name: Добавление данных в лог
+          ansible.builtin.blockinfile:
+            path: /root/vpn-deploy.log
+            block: "{{ connection_message }}"
+            marker: ""
+
+        - name: Проверка сохранённых файлов
+          ansible.builtin.stat:
+            path: "{{ item }}"
+          loop:
+            - "/root/vpn-credentials.txt"
+            - "/root/vpn-deploy.log"
+          register: saved_files
+
+        - name: Вывод информации о сохранённых файлах
+          ansible.builtin.debug:
+            msg: |
+              Файлы сохранены на сервере:
+              - /root/vpn-credentials.txt ({{ (saved_files.results[0].stat.size | default(0)) }} байт)
+              - /root/vpn-deploy.log ({{ (saved_files.results[1].stat.size | default(0)) }} байт)
       tags:
         - connection_info
