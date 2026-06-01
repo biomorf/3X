@@ -780,46 +780,29 @@
     # ============================================================
     # TAG: 3xui_configure
     # ============================================================
-    - name: "[3xui_configure] Настройка панели 3X-UI"
+    - name: "[3xui_configure] Настройка панели 3X-UI (смена пароля)"
       block:
-        - name: Проверка наличия бинарника x-ui в контейнере
+        - name: Ожидание полной загрузки панели
+          ansible.builtin.wait_for:
+            port: "{{ panel_port }}"
+            state: started
+            delay: 5
+            timeout: 60
+
+        - name: Смена логина и пароля через x-ui setting
           ansible.builtin.shell: |
-            docker exec 3x-ui which x-ui
-          register: x_ui_path
-          changed_when: false
-
-        - name: Установка пути к бинарнику
-          ansible.builtin.set_fact:
-            x_ui_binary: "{{ x_ui_path.stdout }}"
-
-        - name: Получение текущих настроек панели
-          ansible.builtin.shell: |
-            docker exec 3x-ui {{ x_ui_binary }} setting -show
-          register: current_settings
-          ignore_errors: yes
-
-        - name: Вывод текущих настроек
-          ansible.builtin.debug:
-            var: current_settings.stdout_lines
-
-        - name: Изменение настроек панели через docker exec
-          ansible.builtin.shell: |
-            docker exec 3x-ui {{ x_ui_binary }} setting \
-              -listenIP 127.0.0.1 \
-              -port {{ panel_port }} \
-              -username {{ panel_user }} \
-              -password {{ panel_pass }}
+            docker exec 3x-ui /usr/bin/x-ui setting -username {{ panel_user }} -password {{ panel_pass }}
           register: setting_result
 
-        - name: Вывод результата настройки
+        - name: Вывод результата смены пароля
           ansible.builtin.debug:
             var: setting_result.stdout_lines
 
-        - name: Перезапуск контейнера для применения настроек
+        - name: Перезапуск контейнера для надёжности
           ansible.builtin.shell: |
             docker restart 3x-ui
 
-        - name: Ожидание перезапуска контейнера
+        - name: Ожидание перезапуска
           ansible.builtin.wait_for:
             port: "{{ panel_port }}"
             state: started
@@ -831,47 +814,243 @@
     # ============================================================
     # TAG: inbound_create
     # ============================================================
-    - name: "[inbound_create] Создание inbound для VLESS+TCP+Reality"
+    - name: "[inbound_create] Создание inbound и клиента (устойчивое)"
       block:
-        - name: Генерация UUID для клиента
+        # ---------- Вход ----------
+        - name: "Логин admin/admin с автосбросом базы при ошибке"
+          block:
+            - name: Логин admin/admin
+              ansible.builtin.shell: |
+                COOKIE=$(mktemp)
+                HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -c "$COOKIE" -X POST \
+                  -H "Content-Type: application/json" \
+                  -d '{"username":"admin","password":"admin"}' \
+                  "http://127.0.0.1:{{ panel_port }}/login")
+                if [ "$HTTP_CODE" = "200" ]; then
+                  echo "COOKIE_FILE=$COOKIE"
+                  echo "LOGIN_OK"
+                else
+                  echo "LOGIN_FAILED_$HTTP_CODE"
+                  rm -f "$COOKIE"
+                fi
+              register: login_attempt
+              changed_when: false
+
+            - name: Сброс базы при неудаче
+              ansible.builtin.shell: |
+                docker exec 3x-ui rm -f /etc/x-ui/x-ui.db
+                docker restart 3x-ui
+              when: "'LOGIN_OK' not in login_attempt.stdout"
+
+            - name: Ожидание перезапуска
+              ansible.builtin.wait_for:
+                port: "{{ panel_port }}"
+                state: started
+                delay: 5
+                timeout: 30
+              when: "'LOGIN_OK' not in login_attempt.stdout"
+
+            - name: Повторный вход
+              ansible.builtin.shell: |
+                COOKIE=$(mktemp)
+                curl -s -c "$COOKIE" -X POST \
+                  -H "Content-Type: application/json" \
+                  -d '{"username":"admin","password":"admin"}' \
+                  "http://127.0.0.1:{{ panel_port }}/login" \
+                  -o /dev/null -w "%{http_code}"
+                echo "COOKIE_FILE=$COOKIE"
+                echo "LOGIN_OK"
+              register: login_ok
+              when: "'LOGIN_OK' not in login_attempt.stdout"
+              changed_when: false
+
+            - name: Сохранение cookie
+              ansible.builtin.set_fact:
+                login_cookie_output: "{{ login_ok.stdout if login_ok.stdout is defined else login_attempt.stdout }}"
+          rescue:
+            - name: Аварийный сброс
+              ansible.builtin.shell: |
+                docker exec 3x-ui rm -f /etc/x-ui/x-ui.db
+                docker restart 3x-ui
+            - name: Ожидание
+              ansible.builtin.wait_for:
+                port: "{{ panel_port }}"
+                state: started
+                delay: 5
+                timeout: 30
+            - name: Финальный вход
+              ansible.builtin.shell: |
+                COOKIE=$(mktemp)
+                curl -s -c "$COOKIE" -X POST \
+                  -H "Content-Type: application/json" \
+                  -d '{"username":"admin","password":"admin"}' \
+                  "http://127.0.0.1:{{ panel_port }}/login" \
+                  -o /dev/null -w "%{http_code}"
+                echo "COOKIE_FILE=$COOKIE"
+                echo "LOGIN_OK"
+              register: rescue_login
+            - name: Сохранение cookie
+              ansible.builtin.set_fact:
+                login_cookie_output: "{{ rescue_login.stdout }}"
+
+        # ---------- Генерация ключей ----------
+        - name: Запрос Reality-ключей с сохранением ответа
+          ansible.builtin.shell: |
+            COOKIE_FILE=$(echo '{{ login_cookie_output }}' | grep COOKIE_FILE | cut -d= -f2)
+            HTTP_CODE=$(curl -s -o /tmp/reality_response.json -w "%{http_code}" -b "$COOKIE_FILE" \
+              "http://127.0.0.1:{{ panel_port }}/panel/api/server/getNewX25519Cert")
+            echo "HTTP_CODE=$HTTP_CODE"
+            cat /tmp/reality_response.json
+            rm -f "$COOKIE_FILE"
+          register: reality_raw
+          changed_when: false
+
+        - name: Вывод ответа Reality API
+          ansible.builtin.debug:
+            var: reality_raw.stdout_lines
+
+        - name: Проверка успешности получения ключей
+          ansible.builtin.fail:
+            msg: |
+              Не удалось получить Reality-ключи. Ответ API:
+              {{ reality_raw.stdout_lines }}
+          when: "'HTTP_CODE=200' not in reality_raw.stdout"
+
+        - name: Извлечение ключей через jq (сохраняем в файл)
+          ansible.builtin.shell: |
+            jq -r '.obj.privateKey' /tmp/reality_response.json > /tmp/priv_key.txt
+            jq -r '.obj.publicKey' /tmp/reality_response.json > /tmp/pub_key.txt
+          when: "'HTTP_CODE=200' in reality_raw.stdout"
+
+        - name: Чтение приватного ключа
+          ansible.builtin.shell: cat /tmp/priv_key.txt
+          register: priv_key_cmd
+          when: "'HTTP_CODE=200' in reality_raw.stdout"
+
+        - name: Чтение публичного ключа
+          ansible.builtin.shell: cat /tmp/pub_key.txt
+          register: pub_key_cmd
+          when: "'HTTP_CODE=200' in reality_raw.stdout"
+
+        - name: Установка фактов ключей
+          ansible.builtin.set_fact:
+            priv_key: "{{ priv_key_cmd.stdout }}"
+            pub_key: "{{ pub_key_cmd.stdout }}"
+          when: priv_key_cmd is defined and pub_key_cmd is defined
+
+        - name: Генерация UUID клиента
           ansible.builtin.shell: |
             cat /proc/sys/kernel/random/uuid
           register: client_uuid
 
-        - name: Логин в панель через curl
+        # ---------- Создание inbound ----------
+        - name: Создание inbound
           ansible.builtin.shell: |
-            COOKIE=$(mktemp)
-            curl -s -c "$COOKIE" -X POST \
-              -H "Content-Type: application/json" \
-              -d '{"username":"{{ panel_user }}","password":"{{ panel_pass }}"}' \
-              "http://127.0.0.1:{{ panel_port }}/login" \
-              -o /dev/null -w "%{http_code}"
-            echo "COOKIE_FILE=$COOKIE"
-          register: login_curl
-          changed_when: false
-
-        - name: Создание inbound VLESS+TCP+Reality через curl
-          ansible.builtin.shell: |
-            COOKIE_FILE=$(echo '{{ login_curl.stdout }}' | grep COOKIE_FILE | cut -d= -f2)
-            curl -s -b "$COOKIE_FILE" -X POST \
+            COOKIE_FILE=$(echo '{{ login_cookie_output }}' | grep COOKIE_FILE | cut -d= -f2)
+            RESPONSE=$(curl -s -b "$COOKIE_FILE" -X POST \
               -H "Content-Type: application/json" \
               -d '{
-                "up": 0,
-                "down": 0,
-                "total": 0,
-                "remark": "VLESS-TCP-Reality",
                 "enable": true,
-                "expiryTime": 0,
+                "remark": "VLESS-TCP-Reality",
                 "listen": "0.0.0.0",
                 "port": {{ xray_port }},
                 "protocol": "vless",
-                "settings": "{\"clients\":[{\"id\":\"{{ client_uuid.stdout }}\",\"email\":\"default@{{ domain }}\",\"flow\":\"xtls-rprx-vision\",\"limitIp\":0,\"totalGB\":0,\"expiryTime\":0,\"enable\":true,\"tgId\":\"\",\"subId\":\"{{ lookup('password', '/dev/null length=8 chars=hexdigits') }}\",\"reset\":0}],\"decryption\":\"none\",\"fallbacks\":[]}",
-                "streamSettings": "{\"network\":\"tcp\",\"security\":\"reality\",\"realitySettings\":{\"show\":false,\"xver\":0,\"dest\":\"{{ reality_dest }}\",\"serverNames\":[\"{{ reality_server_name }}\"],\"privateKey\":\"\",\"publicKey\":\"\",\"shortIds\":[\"{{ lookup('password', '/dev/null length=8 chars=hexdigits') }}\"],\"settings\":{\"fingerprint\":\"chrome\",\"serverName\":\"\",\"spiderX\":\"/\"}}}",
-                "sniffing": "{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\",\"fakedns\"],\"metadataOnly\":false,\"routeOnly\":false}"
+                "expiryTime": 0,
+                "total": 0,
+                "settings": {
+                  "clients": [],
+                  "decryption": "none"
+                },
+                "streamSettings": {
+                  "network": "tcp",
+                  "security": "reality",
+                  "realitySettings": {
+                    "show": false,
+                    "xver": 0,
+                    "dest": "{{ reality_dest }}",
+                    "serverNames": ["{{ reality_server_name }}"],
+                    "privateKey": "{{ priv_key }}",
+                    "publicKey": "{{ pub_key }}",
+                    "shortIds": ["{{ lookup('password', '/dev/null length=8 chars=hexdigits') }}"],
+                    "settings": {
+                      "fingerprint": "chrome",
+                      "serverName": "",
+                      "spiderX": "/"
+                    }
+                  }
+                },
+                "sniffing": {
+                  "enabled": true,
+                  "destOverride": ["http", "tls", "quic", "fakedns"],
+                  "metadataOnly": false,
+                  "routeOnly": false
+                }
               }' \
-              "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/add"
+              "http://127.0.0.1:{{ panel_port }}/panel/api/inbounds/add")
+            echo "$RESPONSE" > /tmp/inbound_response.json
+            INBOUND_ID=$(jq -r '.obj.id // .id // empty' /tmp/inbound_response.json)
+            echo "INBOUND_ID=$INBOUND_ID"
             rm -f "$COOKIE_FILE"
-          register: inbound_curl
+          register: create_inbound
+
+        - name: Вывод ответа API (inbound)
+          ansible.builtin.shell: cat /tmp/inbound_response.json
+          register: debug_inbound
+          changed_when: false
+
+        - name: Показать ответ API
+          ansible.builtin.debug:
+            var: debug_inbound.stdout_lines
+
+        - name: Сохранение inbound_id
+          ansible.builtin.set_fact:
+            inbound_id: "{{ (create_inbound.stdout_lines | select('match', 'INBOUND_ID=') | first | default('')).split('=')[1] | default('') }}"
+
+        - name: Остановка, если inbound не создан
+          ansible.builtin.fail:
+            msg: "Не удалось создать inbound. Ответ выше."
+          when: inbound_id == ''
+
+        # ---------- Создание клиента ----------
+        - name: Создание клиента
+          ansible.builtin.shell: |
+            COOKIE_FILE=$(echo '{{ login_cookie_output }}' | grep COOKIE_FILE | cut -d= -f2)
+            RESPONSE=$(curl -s -b "$COOKIE_FILE" -X POST \
+              -H "Content-Type: application/json" \
+              -d '{
+                "client": {
+                  "email": "default@{{ domain }}",
+                  "id": "{{ client_uuid.stdout }}",
+                  "flow": "xtls-rprx-vision",
+                  "totalGB": 0,
+                  "expiryTime": 0,
+                  "limitIp": 0,
+                  "enable": true
+                },
+                "inboundIds": [{{ inbound_id }}]
+              }' \
+              "http://127.0.0.1:{{ panel_port }}/panel/api/clients/add")
+            echo "$RESPONSE" > /tmp/client_response.json
+            rm -f "$COOKIE_FILE"
+          register: create_client
+
+        - name: Вывод ответа API (клиент)
+          ansible.builtin.shell: cat /tmp/client_response.json
+          register: debug_client
+          changed_when: false
+
+        - name: Показать ответ API (клиент)
+          ansible.builtin.debug:
+            var: debug_client.stdout_lines
+
+        - name: Проверка успешности создания клиента
+          ansible.builtin.fail:
+            msg: "Не удалось создать клиента. Ответ выше."
+          when: "'success\": true' not in debug_client.stdout"
+
+        - name: Сохранение UUID для connection_info
+          ansible.builtin.set_fact:
+            client_uuid_final: "{{ client_uuid.stdout }}"
       tags:
         - inbound_create
 
@@ -880,6 +1059,12 @@
     # ============================================================
     - name: "[connection_info] Вывод данных для подключения"
       block:
+        - name: Получение внешнего IP сервера
+          ansible.builtin.shell: |
+            curl -s ifconfig.me
+          register: ext_ip
+          changed_when: false
+
         - name: Формирование сообщения с данными
           ansible.builtin.set_fact:
             connection_message: |
@@ -893,8 +1078,8 @@
                 Пароль: {{ panel_pass }}
               
               Альтернативный доступ (SSH-туннель):
-                ssh -L 12053:127.0.0.1:{{ panel_port }} def@{{ ansible_default_ipv4.address }}
-                http://127.0.0.1:12053
+                ssh -L 12053:127.0.0.1:{{ panel_port }} {{ ansible_user }}@{{ ext_ip.stdout }}
+                Затем откройте http://127.0.0.1:12053
 
               VLESS+TCP+Reality:
                 Адрес: {{ domain }}
