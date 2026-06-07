@@ -23,6 +23,9 @@
     xray_port: 443
     reality_dest: "login.vk.ru:443"
     reality_server_name: "login.vk.ru"
+    reality_fingerprint: "qq"               # fingerprint браузера (qq, chrome, firefox, random и т.д.)
+    reality_server_name: "eh.vk.com"        # SNI для маскировки
+    reality_short_id: "148cb4094a"          # shortId (можно передать свой или оставить автоматическую генерацию)
 
     # === Docker: "official_script" или "distribution" ===
     docker_install_method: "official_script"
@@ -36,6 +39,10 @@
     db_dir: "{{ work_dir }}/3x-ui-data/db"
     acme_webroot: "/var/www/acme"
     nginx_https_port: 8443
+    base_dir: "/root/3X-UI"
+    inbounds_dir: "{{ base_dir }}/inbounds"
+    extra_clients: []   # список email для дополнительных клиентов (например, ["phone@restart2d.site", "tablet@restart2d.site"])
+
 
     # === Пакеты по дистрибутивам ===
     common_packages:
@@ -277,6 +284,8 @@
         - "{{ cert_dir }}"
         - "{{ db_dir }}"
         - "{{ acme_webroot }}"
+        - "{{ base_dir }}"
+        - "{{ inbounds_dir }}"
       tags:
         - directories_create
 
@@ -994,7 +1003,11 @@
                       privateKey: ""
                       publicKey: ""
                       shortIds:
-                        - "6a8c5e3e1b2f4d7a"
+                        - "{{ reality_short_id }}"
+                      settings:
+                        fingerprint: "{{ reality_fingerprint }}"
+                        serverName: ""
+                        spiderX: "/"
                   sniffing:
                     enabled: true
                     destOverride:
@@ -1211,6 +1224,28 @@
               ansible.builtin.set_fact:
                 reality: "{{ inbound_raw.obj.streamSettings.realitySettings }}"
                 clients: "{{ inbound_raw.obj.settings.clients }}"
+
+            - name: Создать дополнительных клиентов
+              ansible.builtin.uri:
+                url: "http://127.0.0.1:{{ panel_port }}/panel/api/clients/add"
+                method: POST
+                headers:
+                  Authorization: "Bearer {{ panel_api_token }}"
+                  Content-Type: "application/json"
+                body_format: json
+                body:
+                  client:
+                    email: "{{ item }}"
+                    id: "{{ lookup('password', '/dev/null length=36 chars=ascii_letters,digits') }}"   # генерируем случайный UUID
+                    flow: "xtls-rprx-vision"
+                    totalGB: 0
+                    expiryTime: 0
+                    limitIp: 0
+                    enable: true
+                  inboundIds:
+                    - "{{ inbound_id }}"
+              loop: "{{ extra_clients }}"
+              when: extra_clients | length > 0
     
         # ---------- Формирование JSON ----------
         - name: Установить данные первого клиента
@@ -1374,17 +1409,28 @@
               meta:
                 serverDescription: "🇷🇺 LTE 14 | Обход белых списков"
 
-        - name: Сохранить JSON на сервер
+        - name: Определить следующий номер файла для клиента default@{{ domain }}
+          ansible.builtin.shell: |
+            ls "{{ inbounds_dir }}/default@{{ domain }}_"*.json 2>/dev/null | wc -l
+          register: file_count
+          changed_when: false
+
+        - name: Сохранить JSON в inbounds_dir
           ansible.builtin.copy:
-            content: "{{ client_config | to_nice_json }}"
-            dest: /root/client-config.json
+            content: "{{ client_config | to_nice_json }}\n"
+            dest: "{{ inbounds_dir }}/default@{{ domain }}_{{ file_count.stdout | int + 1 }}.json"
             mode: '0644'
-    
+
+        - name: Получить внешний IP сервера (для JSON)
+          ansible.builtin.shell: curl -s ifconfig.me
+          register: client_ext_ip
+          changed_when: false
+
         - name: Подтверждение сохранения
           ansible.builtin.debug:
             msg:
-              - "Клиентский JSON сохранён в /root/client-config.json"
-              - "Скачайте файл на локальную машину через SSH-туннель или scp."
+              - "Клиентский JSON сохранён в {{ inbounds_dir }}/default@{{ domain }}_{{ file_count.stdout | int + 1 }}.json"
+              - "Скачайте файл командой: scp {{ ansible_user }}@{{ client_ext_ip.stdout }}:{{ inbounds_dir }}/default@{{ domain }}_{{ file_count.stdout | int + 1 }}.json ./"
 
       tags:
         - client_config_export
@@ -1430,9 +1476,8 @@
                 SNI: {{ reality_server_name }}
                 Fingerprint: chrome
                 
-              Клиентский JSON-конфиг: /root/client-config.json
-              Скачайте командой:
-                scp {{ ansible_user }}@{{ ext_ip.stdout }}:/root/client-config.json ./
+              Клиентский JSON-конфиг: {{ inbounds_dir }}/default@{{ domain }}_*.json
+              Скачайте командой: scp {{ ansible_user }}@{{ ext_ip.stdout }}:{{ inbounds_dir }}/default@{{ domain }}_*.json ./
 
         - name: Вывод данных в консоль
           ansible.builtin.debug:
@@ -1441,24 +1486,24 @@
         - name: Сохранение учетных данных в файл
           ansible.builtin.copy:
             content: "{{ connection_message }}"
-            dest: "/root/vpn-credentials.txt"
+            dest: "{{ base_dir }}/vpn-credentials.txt"
             mode: '0600'
 
         - name: Добавление записи в лог деплоев
           ansible.builtin.lineinfile:
-            path: /root/vpn-deploy.log
+            path: "{{ base_dir }}/vpn-deploy.log"
             line: "========================================"
             create: yes
             mode: '0600'
 
         - name: Добавление даты в лог
           ansible.builtin.lineinfile:
-            path: /root/vpn-deploy.log
+            path: "{{ base_dir }}/vpn-deploy.log"
             line: "Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}"
 
         - name: Добавление данных в лог
           ansible.builtin.blockinfile:
-            path: /root/vpn-deploy.log
+            path: "{{ base_dir }}/vpn-deploy.log"
             block: "{{ connection_message }}"
             marker: ""
 
@@ -1466,15 +1511,15 @@
           ansible.builtin.stat:
             path: "{{ item }}"
           loop:
-            - "/root/vpn-credentials.txt"
-            - "/root/vpn-deploy.log"
+            - "{{ base_dir }}/vpn-credentials.txt"
+            - "{{ base_dir }}/vpn-deploy.log"
           register: saved_files
 
         - name: Вывод информации о сохранённых файлах
           ansible.builtin.debug:
             msg: |
               Файлы сохранены на сервере:
-              - /root/vpn-credentials.txt ({{ (saved_files.results[0].stat.size | default(0)) }} байт)
-              - /root/vpn-deploy.log ({{ (saved_files.results[1].stat.size | default(0)) }} байт)
+              - {{ base_dir }}/vpn-credentials.txt ({{ (saved_files.results[0].stat.size | default(0)) }} байт)
+              - {{ base_dir }}/vpn-deploy.log ({{ (saved_files.results[1].stat.size | default(0)) }} байт)
       tags:
         - connection_info
