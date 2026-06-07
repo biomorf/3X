@@ -17,6 +17,7 @@
     x_ui_binary: "/usr/bin/x-ui"
     reset_3xui_db: false          # установите true, чтобы сбросить базу данных 3X-UI
     panel_api_token: "ВАШ_ТОКЕН_ЗДЕСЬ"   # API-токен панели 3X-UI
+    panel_external_access: false   # установите true, чтобы открыть панель снаружи через nginx
 
     # === Параметры прокси ===
     xray_port: 443
@@ -484,13 +485,33 @@
     # ============================================================
     # TAG: nginx_final_configure
     # ============================================================
-    - name: "[nginx_final_configure] Финальная настройка nginx с HTTPS и панелью на поддомене"
+    - name: "[nginx_final_configure] Финальная настройка nginx (управляемый доступ)"
       block:
+        # ---------- Определение пути к панели ----------
+        - name: Определить panel_proxy_path
+          block:
+            - name: Прочитать сохранённый путь
+              ansible.builtin.shell: cat /root/panel-path.txt 2>/dev/null || echo ""
+              register: saved_panel_path
+              changed_when: false
+    
+            - name: Установить panel_proxy_path (прочитанный или новый)
+              ansible.builtin.set_fact:
+                panel_proxy_path: "{{ saved_panel_path.stdout if saved_panel_path.stdout != '' else '/panel-' + lookup('password', '/dev/null length=12 chars=hexdigits') }}"
+    
+            - name: Сохранить путь на будущее, если он новый
+              ansible.builtin.copy:
+                content: "{{ panel_proxy_path }}"
+                dest: /root/panel-path.txt
+                mode: '0600'
+              when: saved_panel_path.stdout == ''
+    
+        # ---------- Проверка сертификата ----------
         - name: Проверка наличия валидного сертификата
           ansible.builtin.stat:
             path: "{{ cert_dir }}/fullchain.cer"
           register: final_cert_check
-
+    
         - name: Проверка валидности сертификата
           ansible.builtin.shell: |
             openssl x509 -in "{{ cert_dir }}/fullchain.cer" -noout -subject 2>&1 || echo "INVALID"
@@ -498,18 +519,18 @@
           when: final_cert_check.stat.exists and final_cert_check.stat.size | default(0) >= 100
           changed_when: false
           ignore_errors: yes
-
+    
         - name: Установка факта валидности сертификата
           ansible.builtin.set_fact:
             cert_is_valid: "{{ cert_valid_check.stdout | default('INVALID') != 'INVALID' }}"
           when: final_cert_check.stat.exists
-
+    
         - name: Пропуск настройки HTTPS при отсутствии валидного сертификата
           ansible.builtin.debug:
             msg: "Сертификат не найден или невалиден. Пропускаем настройку HTTPS."
           when: not cert_is_valid | default(false)
-
-        - name: Полная очистка ВСЕХ конфигураций nginx
+    
+        - name: Полная очистка всех конфигураций nginx
           ansible.builtin.shell: |
             rm -f /etc/nginx/sites-enabled/*
             rm -f /etc/nginx/sites-available/*
@@ -517,52 +538,99 @@
             sed -i '/ssl_certificate/d; /ssl_certificate_key/d' /etc/nginx/nginx.conf 2>/dev/null || true
           ignore_errors: yes
           when: cert_is_valid | default(false)
-
-        - name: Создание конфигурации nginx (основной домен + панельный поддомен)
+    
+        # ---------- Конфигурация без внешнего доступа к панели ----------
+        - name: Создание конфигурации nginx (без прокси к панели)
           ansible.builtin.copy:
             content: |
-              # HTTP для обоих доменов -> HTTPS
               server {
                   listen 80;
                   server_name {{ domain }} {{ panel_domain }};
                   root {{ acme_webroot }};
-
+    
                   location /.well-known/acme-challenge/ {
                       root {{ acme_webroot }};
                   }
-
+    
                   location / {
                       return 301 https://$host:{{ nginx_https_port }}$request_uri;
                   }
               }
-
-              # Основной домен: заглушка
+    
               server {
                   listen {{ nginx_https_port }} ssl http2;
                   server_name {{ domain }};
-
+    
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-
+    
                   location / {
                       return 200 "OK";
                   }
               }
-
-              # Панельный поддомен: проксирование панели
+    
               server {
                   listen {{ nginx_https_port }} ssl http2;
                   server_name {{ panel_domain }};
-
+    
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-
+    
                   location / {
-                      proxy_pass http://127.0.0.1:{{ panel_port }}/;
+                      return 200 "OK";
+                  }
+              }
+            dest: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
+            mode: '0644'
+          when: cert_is_valid | default(false) and not (panel_external_access | bool)
+    
+        # ---------- Конфигурация с внешним доступом к панели ----------
+        - name: Создание конфигурации nginx (с прокси к панели)
+          ansible.builtin.copy:
+            content: |
+              server {
+                  listen 80;
+                  server_name {{ domain }} {{ panel_domain }};
+                  root {{ acme_webroot }};
+    
+                  location /.well-known/acme-challenge/ {
+                      root {{ acme_webroot }};
+                  }
+    
+                  location / {
+                      return 301 https://$host:{{ nginx_https_port }}$request_uri;
+                  }
+              }
+    
+              server {
+                  listen {{ nginx_https_port }} ssl http2;
+                  server_name {{ domain }};
+    
+                  ssl_certificate {{ cert_dir }}/fullchain.cer;
+                  ssl_certificate_key {{ cert_dir }}/private.key;
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    
+                  location / {
+                      return 200 "OK";
+                  }
+              }
+    
+              server {
+                  listen {{ nginx_https_port }} ssl http2;
+                  server_name {{ panel_domain }};
+    
+                  ssl_certificate {{ cert_dir }}/fullchain.cer;
+                  ssl_certificate_key {{ cert_dir }}/private.key;
+                  ssl_protocols TLSv1.2 TLSv1.3;
+                  ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    
+                  location {{ panel_proxy_path }} {
+                      proxy_pass http://127.0.0.1:{{ panel_port }};
                       proxy_http_version 1.1;
                       proxy_set_header Upgrade $http_upgrade;
                       proxy_set_header Connection "upgrade";
@@ -571,11 +639,16 @@
                       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                       proxy_set_header X-Forwarded-Proto $scheme;
                   }
+    
+                  location / {
+                      return 200 "OK";
+                  }
               }
             dest: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
             mode: '0644'
-          when: cert_is_valid | default(false)
-
+          when: cert_is_valid | default(false) and (panel_external_access | bool)
+    
+        # ---------- Применение конфигурации ----------
         - name: Включение сайта
           ansible.builtin.file:
             src: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
@@ -583,21 +656,21 @@
             state: link
             force: yes
           when: cert_is_valid | default(false)
-
+    
         - name: Проверка конфигурации nginx
           ansible.builtin.shell: |
             nginx -t
           register: nginx_final_test
           when: cert_is_valid | default(false)
           ignore_errors: yes
-
+    
         - name: Вывод ошибки конфигурации
           ansible.builtin.debug:
             var: nginx_final_test.stderr_lines
           when:
             - nginx_final_test is defined
             - nginx_final_test.rc | default(0) != 0
-
+    
         - name: Перезапуск nginx
           ansible.builtin.systemd:
             name: nginx
@@ -606,7 +679,7 @@
           when:
             - nginx_final_test is defined
             - nginx_final_test.rc | default(1) == 0
-
+    
         - name: Проверка доступности порта {{ nginx_https_port }}
           ansible.builtin.wait_for:
             port: "{{ nginx_https_port }}"
@@ -618,6 +691,8 @@
             - nginx_final_test.rc | default(1) == 0
       tags:
         - nginx_final_configure
+
+
 
     # ============================================================
     # TAG: docker_install
@@ -1318,7 +1393,6 @@
         - always
 
 
-
     # ============================================================
     # TAG: connection_info
     # ============================================================
@@ -1337,15 +1411,18 @@
               Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
               Дистрибутив: {{ ansible_distribution }}
               
-              Панель управления:
-                https://{{ panel_domain }}:{{ nginx_https_port }}/
+              {% if panel_external_access | bool %}
+              Панель управления доступна снаружи:
+                https://{{ panel_domain }}:{{ nginx_https_port }}{{ panel_proxy_path }}
                 Логин: {{ panel_user }}
                 Пароль: {{ panel_pass }}
-              
-              Альтернативный доступ (SSH-туннель):
+              {% endif %}
+              Доступ к панели через SSH-туннель:
                 ssh -L 12053:127.0.0.1:{{ panel_port }} {{ ansible_user }}@{{ ext_ip.stdout }}
                 Затем откройте http://127.0.0.1:12053
-    
+                Логин: {{ panel_user }}
+                Пароль: {{ panel_pass }}
+        
               VLESS+TCP+Reality:
                 Адрес: {{ domain }}
                 Порт: {{ xray_port }}
@@ -1355,9 +1432,9 @@
                 SNI: {{ reality_server_name }}
                 Fingerprint: chrome
                 
-              ВНИМАНИЕ: Reality-ключи генерируются панелью автоматически.
-              Зайдите в панель, откройте inbound и скопируйте готовую vless:// ссылку.
-    
+              Клиентский JSON-конфиг: /root/client-config.json
+              Скачайте командой:
+                scp {{ ansible_user }}@{{ ext_ip.stdout }}:/root/client-config.json ./
         - name: Вывод данных в консоль
           ansible.builtin.debug:
             msg: "{{ connection_message }}"
@@ -1400,7 +1477,5 @@
               Файлы сохранены на сервере:
               - /root/vpn-credentials.txt ({{ (saved_files.results[0].stat.size | default(0)) }} байт)
               - /root/vpn-deploy.log ({{ (saved_files.results[1].stat.size | default(0)) }} байт)
-              Клиентский JSON-конфиг: /root/client-config.json
-              Скачать: scp {{ ansible_user }}@{{ ext_ip.stdout }}:/root/client-config.json .
       tags:
         - connection_info
