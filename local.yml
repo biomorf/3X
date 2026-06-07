@@ -485,33 +485,14 @@
     # ============================================================
     # TAG: nginx_final_configure
     # ============================================================
-    - name: "[nginx_final_configure] Финальная настройка nginx (управляемый доступ)"
+    - name: "[nginx_final_configure] Финальная настройка nginx (управляемый доступ + автотест)"
       block:
-        # ---------- Определение пути к панели ----------
-        - name: Определить panel_proxy_path
-          block:
-            - name: Прочитать сохранённый путь
-              ansible.builtin.shell: cat /root/panel-path.txt 2>/dev/null || echo ""
-              register: saved_panel_path
-              changed_when: false
-    
-            - name: Установить panel_proxy_path (прочитанный или новый)
-              ansible.builtin.set_fact:
-                panel_proxy_path: "{{ saved_panel_path.stdout if saved_panel_path.stdout != '' else '/panel-' + lookup('password', '/dev/null length=12 chars=hexdigits') }}"
-    
-            - name: Сохранить путь на будущее, если он новый
-              ansible.builtin.copy:
-                content: "{{ panel_proxy_path }}"
-                dest: /root/panel-path.txt
-                mode: '0600'
-              when: saved_panel_path.stdout == ''
-    
         # ---------- Проверка сертификата ----------
         - name: Проверка наличия валидного сертификата
           ansible.builtin.stat:
             path: "{{ cert_dir }}/fullchain.cer"
           register: final_cert_check
-    
+
         - name: Проверка валидности сертификата
           ansible.builtin.shell: |
             openssl x509 -in "{{ cert_dir }}/fullchain.cer" -noout -subject 2>&1 || echo "INVALID"
@@ -519,17 +500,17 @@
           when: final_cert_check.stat.exists and final_cert_check.stat.size | default(0) >= 100
           changed_when: false
           ignore_errors: yes
-    
+
         - name: Установка факта валидности сертификата
           ansible.builtin.set_fact:
             cert_is_valid: "{{ cert_valid_check.stdout | default('INVALID') != 'INVALID' }}"
           when: final_cert_check.stat.exists
-    
+
         - name: Пропуск настройки HTTPS при отсутствии валидного сертификата
           ansible.builtin.debug:
             msg: "Сертификат не найден или невалиден. Пропускаем настройку HTTPS."
           when: not cert_is_valid | default(false)
-    
+
         - name: Полная очистка всех конфигураций nginx
           ansible.builtin.shell: |
             rm -f /etc/nginx/sites-enabled/*
@@ -538,99 +519,99 @@
             sed -i '/ssl_certificate/d; /ssl_certificate_key/d' /etc/nginx/nginx.conf 2>/dev/null || true
           ignore_errors: yes
           when: cert_is_valid | default(false)
-    
-        # ---------- Конфигурация без внешнего доступа к панели ----------
-        - name: Создание конфигурации nginx (без прокси к панели)
+
+        # ---------- Конфигурация при ЗАКРЫТОМ внешнем доступе ----------
+        - name: Создание конфигурации nginx (без внешнего доступа к панели)
           ansible.builtin.copy:
             content: |
               server {
                   listen 80;
                   server_name {{ domain }} {{ panel_domain }};
                   root {{ acme_webroot }};
-    
+
                   location /.well-known/acme-challenge/ {
                       root {{ acme_webroot }};
                   }
-    
+
                   location / {
                       return 301 https://$host:{{ nginx_https_port }}$request_uri;
                   }
               }
-    
+
               server {
                   listen {{ nginx_https_port }} ssl http2;
                   server_name {{ domain }};
-    
+
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-    
+
                   location / {
                       return 200 "OK";
                   }
               }
-    
+
               server {
                   listen {{ nginx_https_port }} ssl http2;
                   server_name {{ panel_domain }};
-    
+
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-    
+
                   location / {
                       return 200 "OK";
                   }
               }
             dest: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
             mode: '0644'
-          when: cert_is_valid | default(false) and not (panel_external_access | bool)
-    
-        # ---------- Конфигурация с внешним доступом к панели ----------
-        - name: Создание конфигурации nginx (с прокси к панели)
+          when: cert_is_valid | default(false) and panel_external_access != 'true'
+
+        # ---------- Конфигурация при ОТКРЫТОМ внешнем доступе ----------
+        - name: Создание конфигурации nginx (с внешним доступом к панели)
           ansible.builtin.copy:
             content: |
               server {
                   listen 80;
                   server_name {{ domain }} {{ panel_domain }};
                   root {{ acme_webroot }};
-    
+
                   location /.well-known/acme-challenge/ {
                       root {{ acme_webroot }};
                   }
-    
+
                   location / {
                       return 301 https://$host:{{ nginx_https_port }}$request_uri;
                   }
               }
-    
+
               server {
                   listen {{ nginx_https_port }} ssl http2;
                   server_name {{ domain }};
-    
+
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-    
+
                   location / {
                       return 200 "OK";
                   }
               }
-    
+
               server {
-                  listen {{ nginx_https_port }} ssl http2;
+                  listen {{ nginx_https_port }} ssl http2 default_server;
                   server_name {{ panel_domain }};
-    
+
                   ssl_certificate {{ cert_dir }}/fullchain.cer;
                   ssl_certificate_key {{ cert_dir }}/private.key;
                   ssl_protocols TLSv1.2 TLSv1.3;
                   ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-    
-                  location {{ panel_proxy_path }} {
-                      proxy_pass http://127.0.0.1:{{ panel_port }};
+
+                  location / {
+                      proxy_pass http://127.0.0.1:{{ panel_port }}/;
                       proxy_http_version 1.1;
                       proxy_set_header Upgrade $http_upgrade;
                       proxy_set_header Connection "upgrade";
@@ -639,15 +620,11 @@
                       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
                       proxy_set_header X-Forwarded-Proto $scheme;
                   }
-    
-                  location / {
-                      return 200 "OK";
-                  }
               }
             dest: "/etc/nginx/sites-available/3x-ui-{{ domain }}.conf"
             mode: '0644'
-          when: cert_is_valid | default(false) and (panel_external_access | bool)
-    
+          when: cert_is_valid | default(false) and panel_external_access == 'true'
+
         # ---------- Применение конфигурации ----------
         - name: Включение сайта
           ansible.builtin.file:
@@ -656,22 +633,22 @@
             state: link
             force: yes
           when: cert_is_valid | default(false)
-    
+
         - name: Проверка конфигурации nginx
           ansible.builtin.shell: |
             nginx -t
           register: nginx_final_test
           when: cert_is_valid | default(false)
           ignore_errors: yes
-    
+
         - name: Вывод ошибки конфигурации
           ansible.builtin.debug:
             var: nginx_final_test.stderr_lines
           when:
             - nginx_final_test is defined
             - nginx_final_test.rc | default(0) != 0
-    
-        - name: Перезапуск nginx
+
+        - name: Принудительный перезапуск nginx (безусловно, если конфиг корректен)
           ansible.builtin.systemd:
             name: nginx
             state: restarted
@@ -679,7 +656,7 @@
           when:
             - nginx_final_test is defined
             - nginx_final_test.rc | default(1) == 0
-    
+
         - name: Проверка доступности порта {{ nginx_https_port }}
           ansible.builtin.wait_for:
             port: "{{ nginx_https_port }}"
@@ -689,6 +666,27 @@
           when:
             - nginx_final_test is defined
             - nginx_final_test.rc | default(1) == 0
+
+        # ---------- Автотест доступа к панели снаружи ----------
+        - name: Проверить доступность панели через внешний URL
+          when: panel_external_access == 'true'
+          block:
+            - name: Выполнить curl к панели
+              ansible.builtin.shell: |
+                curl -sk -o /dev/null -w "%{http_code}" "https://{{ panel_domain }}:{{ nginx_https_port }}/"
+              register: panel_curl
+              changed_when: false
+
+            - name: Показать HTTP-код ответа
+              ansible.builtin.debug:
+                msg: "HTTP status панели: {{ panel_curl.stdout }}"
+
+            - name: Предупреждение, если статус не 200
+              ansible.builtin.debug:
+                msg: >
+                  Панель вернула статус {{ panel_curl.stdout }}.
+                  Проверьте, что DNS поддомена {{ panel_domain }} указывает на сервер.
+              when: panel_curl.stdout != '200'
       tags:
         - nginx_final_configure
 
@@ -1403,7 +1401,7 @@
             curl -s ifconfig.me
           register: ext_ip
           changed_when: false
-    
+
         - name: Формирование сообщения с данными
           ansible.builtin.set_fact:
             connection_message: |
@@ -1411,9 +1409,9 @@
               Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}
               Дистрибутив: {{ ansible_distribution }}
               
-              {% if panel_external_access | bool %}
+              {% if panel_external_access == 'true' %}
               Панель управления доступна снаружи:
-                https://{{ panel_domain }}:{{ nginx_https_port }}{{ panel_proxy_path }}
+                https://{{ panel_domain }}:{{ nginx_https_port }}/
                 Логин: {{ panel_user }}
                 Пароль: {{ panel_pass }}
               {% endif %}
@@ -1435,34 +1433,35 @@
               Клиентский JSON-конфиг: /root/client-config.json
               Скачайте командой:
                 scp {{ ansible_user }}@{{ ext_ip.stdout }}:/root/client-config.json ./
+
         - name: Вывод данных в консоль
           ansible.builtin.debug:
             msg: "{{ connection_message }}"
-    
+
         - name: Сохранение учетных данных в файл
           ansible.builtin.copy:
             content: "{{ connection_message }}"
             dest: "/root/vpn-credentials.txt"
             mode: '0600'
-    
+
         - name: Добавление записи в лог деплоев
           ansible.builtin.lineinfile:
             path: /root/vpn-deploy.log
             line: "========================================"
             create: yes
             mode: '0600'
-    
+
         - name: Добавление даты в лог
           ansible.builtin.lineinfile:
             path: /root/vpn-deploy.log
             line: "Дата: {{ ansible_date_time.date }} {{ ansible_date_time.time }}"
-    
+
         - name: Добавление данных в лог
           ansible.builtin.blockinfile:
             path: /root/vpn-deploy.log
             block: "{{ connection_message }}"
             marker: ""
-    
+
         - name: Проверка сохранённых файлов
           ansible.builtin.stat:
             path: "{{ item }}"
@@ -1470,7 +1469,7 @@
             - "/root/vpn-credentials.txt"
             - "/root/vpn-deploy.log"
           register: saved_files
-    
+
         - name: Вывод информации о сохранённых файлах
           ansible.builtin.debug:
             msg: |
